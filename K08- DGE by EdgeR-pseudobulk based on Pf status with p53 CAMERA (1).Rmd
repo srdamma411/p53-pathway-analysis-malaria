@@ -1,0 +1,494 @@
+---
+title: "K08: DGE by EdgeR-pseudobulk based on Pf status with p53 CAMERA"
+author: "Srija"
+date: "2023-12-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Load packages
+```{r}
+library(Seurat) 
+library(patchwork)
+library(SeuratDisk)
+library(tidyverse)
+library(magrittr)
+library(googledrive)
+library(ggpubr)
+library(scales)
+library(RColorBrewer)
+library(viridis)
+library(scRNAseq)
+library(scran)
+library(Glimma)
+library(edgeR)
+library(SingleCellExperiment)
+```
+
+```{r}
+# Authenticate Google Drive (will ask you to log in)
+drive_auth()
+
+# Use the file ID to get the file
+file_id <- as_id("1swCwEuB3ez48nDHl1jXPTBGdhMPIzX0m")
+
+# Download to a temp path
+temp_rds <- tempfile(fileext = ".rds")
+drive_download(file = file_id, path = temp_rds, overwrite = TRUE)
+
+```
+
+```{r}
+refmapped.all <- readRDS("refmapped_all.rds")
+```
+
+# Let's look at the cells
+```{r}
+dimplot_hires<-DimPlot(refmapped.all, reduction = "ref.umap", group.by = "predicted.celltype.l2", pt.size =0.35, label = T, raster = F) +
+    NoLegend() +
+     ggtitle("K08_CITEseq: High resolution celltype annotation")
+
+# Very few monocytes (n=133, we will have to adjust cutoffs downstream)
+tab<-table(refmapped.all$Sample.ID, refmapped.all$predicted.celltype.l2)
+colSums(tab)
+```
+
+### subset and extract the cells from a Seurat object
+
+```{r, subset and extract from seurat}
+# Extract raw counts and metadata to create SingleCellExperiment object
+counts <- refmapped.all@assays$RNA@counts 
+metadata <- refmapped.all@meta.data
+# Set up metadata as desired for aggregation and DE analysis
+refmapped.all <- SetIdent(refmapped.all, value = factor(gsub("\\_"," ", refmapped.all@meta.data$predicted.celltype.l2)))
+metadata$cluster_id <- factor(refmapped.all@active.ident)
+metadata <- metadata %>%
+  dplyr::rename(sample_id = "Sample.ID",
+                class = "pfstatus") %>%
+  mutate(class = factor(tolower(class))) %>%
+  mutate(experiment_mode = factor(gsub(".*a\\_", "", sample_id))) %>%
+  mutate(sample_id = factor(gsub("\\_.*", "", tolower(sample_id))))
+# Create single cell experiment object
+sce <- SingleCellExperiment(assays = list(counts = counts), 
+                           colData = metadata)
+#change colnames of coldata to more r friendy names
+colnames(colData(sce)) <- gsub("\\.","_",  colnames(colData(sce)))
+# Identify groups for aggregation of counts
+groups <- colData(sce)[, c("cluster_id", "sample_id", "predicted_celltype_l2")] 
+```
+
+
+### Identify highly variable genes for creating MDS plot using OSCA procedure
+
+```{r follow OSCA procedure}
+#uses scuttle, scran
+sce <- scuttle::logNormCounts(sce)
+var_mod <- scran::modelGeneVar(sce)
+hvg_genes <- scran::getTopHVGs(var_mod, n=500)
+hvg_sce <- sce[hvg_genes, ]
+hvg_sce <- logNormCounts(hvg_sce)
+```
+
+
+### acquiring necessary metrics for aggregation across cells in a sample
+
+```{r, acquire metrics}
+# Named vector of cluster names
+kids <- purrr::set_names(levels(sce$cluster_id))
+kids
+# Total number of clusters
+nk <- length(kids)
+nk
+# Named vector of sample names
+sids <- purrr::set_names(levels(sce$sample_id))
+# Total number of samples 
+ns <- length(sids)
+ns
+# Generate sample level metadata
+## Determine the number of cells per sample
+table(sce$sample_id)
+table(sce$experiment_mode)
+## Turn named vector into a numeric vector of number of cells per sample
+n_cells <- as.numeric(table(sce$sample_id))
+## Determine how to reorder the samples (rows) of the metadata to match the order of sample names in sids vector
+m <- match(sids, sce$sample_id)
+## Create the sample level metadata by combining the reordered metadata with the number of cells corresponding to each sample.
+ei <- data.frame(colData(sce)[m, ], 
+                  n_cells, row.names = NULL) %>% 
+                dplyr::select(-"cluster_id")
+ei %>%
+  dplyr::select(class, sample_id, n_cells)
+```
+
+
+
+### Remove low quality genes 
+
+(re-read vignette to important points)
+
+```{r, remove low quality using scater}
+#skip because can't install scater
+# Perform QC if not already performed
+dim(sce)
+# Calculate quality control (QC) metrics
+#sce <- calculateQCMetrics(sce)
+# Get cells w/ few/many detected genes
+#sce$is_outlier <- isOutlier(
+#        metric = sce$total_features_by_counts,
+#        nmads = 2, type = "both", log = TRUE)
+# Remove outlier cells
+#sce <- sce[, !sce$is_outlier]
+```
+
+
+```{r, remove lowly expressed genes}
+## Remove lowly expressed genes which have less than 20 cells with any counts
+dim(sce)
+sce <- sce[rowSums(counts(sce) > 1) >= 20, ]
+dim(sce)
+```
+
+## Count aggregation to sample level
+
+```{r, count aggregation to sample level}
+# Aggregate the counts per sample_id and cluster_id
+# Subset metadata to only include the cluster and sample IDs to aggregate across
+groups <- colData(sce)[, c("cluster_id", "sample_id")]
+# Aggregate across cluster-sample groups
+pb <- Matrix.utils::aggregate.Matrix(t(counts(sce)), 
+                       groupings = groups, fun = "sum") 
+class(pb)
+dim(pb)
+pb[1:6, 1:6]
+```
+
+### Split data by cell type
+
+```{r split data by cell type}
+# Not every cluster is present in all samples; create a vector that represents how to split samples
+splitf <- sapply(stringr::str_split(rownames(pb), 
+                                    pattern = "_(?!.*_)",
+                                    n = 2), 
+                 `[`, 1)
+# Turn into a list and split the list into components for each cluster and transform, so rows are genes and columns are samples and make rownames as the sample IDs
+pb <- split.data.frame(pb, 
+                       factor(splitf)) %>%
+        lapply(function(u) 
+                set_colnames(t(u), 
+                             stringr::str_extract(rownames(u), "(?<=_)[:alnum:]+")))
+class(pb)
+# Explore the different components of list
+str(pb)
+```
+
+### Check counts per sample for each cluster
+
+```{r, check counts per sample for each cluster}
+# Print out the table of cells in each cluster-sample group
+options(width = 100)
+table(sce$cluster_id, sce$sample_id)
+colSums(table(sce$cluster_id, sce$sample_id))
+colSums(t(table(sce$cluster_id, sce$sample_id)))
+cell_types_above_100 <- levels(sce$cluster_id)[colSums(t(table(sce$cluster_id, sce$sample_id))) > 100] #limit to cell types with enough cells
+```
+
+## Prepare sample-level metadata for DE anaylsis
+
+```{r, prepare sample level metadata}
+# Get sample names for each of the cell type clusters
+# prep. data.frame for plotting
+get_sample_ids <- function(x){
+        pb[[x]] %>% 
+                colnames()
+}
+de_samples <- map(1:length(kids), get_sample_ids) %>%
+        unlist()
+# Get cluster IDs for each of the samples
+samples_list <- map(1:length(kids), get_sample_ids)
+get_cluster_ids <- function(x){
+        rep(names(pb)[x], 
+            each = length(samples_list[[x]]))
+}
+de_cluster_ids <- map(1:length(kids), get_cluster_ids) %>%
+        unlist()
+# Create a data frame with the sample IDs, cluster IDs and condition
+gg_df <- data.frame(cluster_id = de_cluster_ids,
+                    sample_id = de_samples)
+gg_df <- left_join(gg_df, ei[, c("sample_id", "class")]) 
+metadata <- gg_df %>%
+        dplyr::select(cluster_id, sample_id, class) 
+        
+metadata 
+```
+
+### Subsetting dataset to cluster(s) of interest
+
+```{r subset to clusters of interest}
+# Generate vector of cluster IDs
+clusters <- levels(factor(metadata$cluster_id))
+clusters
+```
+
+Subset on celltype of interest and run edgeR as a loop
+```{r}
+
+```
+
+https://bioconductor.org/packages/release/bioc/vignettes/Glimma/inst/doc/single_cell_edger.html
+
+```{r subset on celltype of interest then run edgeR all in a loop}
+p53_gene_list <- readRDS("p53_geneset.rds")
+
+# Define input variables (assume already computed)
+# cell_types_above_100 = names of cell types with ≥100 cells
+# pb = pseudobulk counts per cell type
+# metadata = sample metadata containing class (e.g., pf_plus/pf_neg)
+
+# Initialize outputs
+pb_mroast_p53 <- pb_camera_p53 <- toptags_tbl <- list()
+pb_qlf <- pb_qlfit <- pb_lrt <- pb_fit <- contr <- design <- dge_pb <- counts <- cluster_counts <- cluster_metadata <- 
+  sapply(cell_types_above_100, function(x) NULL)
+
+for(i in cell_types_above_100){
+  cluster_metadata[[i]] <- metadata[which(metadata$cluster_id == i), ]
+  rownames(cluster_metadata[[i]]) <- cluster_metadata[[i]]$sample_id
+  counts[[i]] <- pb[[i]]
+  cluster_counts[[i]] <- data.frame(counts[[i]][, colnames(counts[[i]]) %in% rownames(cluster_metadata[[i]])])
+
+  if(all(rownames(cluster_metadata[[i]]) == colnames(cluster_counts[[i]]))){
+    print(paste0("Sample/Count match: ", i))
+  }
+
+  dge_pb[[i]] <- DGEList(counts = cluster_counts[[i]], samples = cluster_metadata[[i]], group = cluster_metadata[[i]]$class)
+  dge_pb[[i]] <- calcNormFactors(dge_pb[[i]])
+  design[[i]] <- model.matrix(~0 + class, data = dge_pb[[i]]$samples)
+  colnames(design[[i]]) <- make.names(gsub("class", "", colnames(design[[i]])))
+  dge_pb[[i]] <- estimateDisp(dge_pb[[i]], design[[i]])
+  contr[[i]] <- makeContrasts(pf_plus - pf_neg, levels = design[[i]])
+
+  pb_fit[[i]] <- glmFit(dge_pb[[i]], design[[i]], robust = TRUE)
+  pb_lrt[[i]] <- glmLRT(pb_fit[[i]], contrast = contr[[i]])
+  pb_qlfit[[i]] <- glmQLFit(dge_pb[[i]], design[[i]], robust = TRUE)
+  pb_qlf[[i]] <- glmQLFTest(pb_qlfit[[i]], contrast = contr[[i]])
+
+  # Run mroast and camera using your p53 gene list
+  pb_mroast_p53[[i]] <- mroast(dge_pb[[i]], index = gene_list, design = design[[i]], contrast = contr[[i]])
+  pb_camera_p53[[i]] <- camera(dge_pb[[i]], index = gene_list, design = design[[i]], contrast = contr[[i]])
+
+  # Top DE genes
+  toptags_tbl[[i]] <- topTags(pb_qlf[[i]], n = nrow(pb_qlf[[i]]))
+}
+
+
+```
+
+
+
+#Plot CAMERA and mroast results
+```{r}
+# Required libraries
+library(tibble)
+library(purrr)
+
+# Plot settings
+basetextsize <- 12
+myfont <- "sans"
+bubble_max_size <- 24
+mycolors <- c("Up" = "#F21A00", "Down" = "#3B9AB2")
+
+# Combine CAMERA results
+camera_bound <- imap(pb_camera_p53, ~ .x %>%
+                       rownames_to_column("pathway")) %>%
+  bind_rows(.id = "cell_type")
+
+# Filter significant pathways
+camera_filtered <- camera_bound %>%
+  mutate(neglog10fdr = -log10(FDR)) %>%
+  arrange(desc(neglog10fdr)) %>%
+  filter(FDR < 0.2) %>%
+  filter(cell_type != "dnT")  # Optional
+
+# Create bubble plot
+plot_camera_bubble <- ggplot(camera_filtered, aes(x = cell_type, y = pathway, color = Direction)) +
+  geom_point(aes(size = neglog10fdr), alpha = 0.65) +
+  scale_color_manual(values = mycolors, name = "Regulation") +
+  scale_size_area(name = expression(-log[10]~FDR), max_size = bubble_max_size) +
+  theme_minimal(base_family = myfont, base_size = basetextsize) +
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    legend.position = "bottom",
+    strip.background = element_blank()
+  ) +
+  coord_flip()
+
+# Print plot
+print(plot_camera_bubble)
+
+# Save plot to file (optional)
+ggsave("camera_p53_bubbleplot.pdf", plot_camera_bubble, width = 12, height = 7)
+
+
+```
+
+## Fischer p53 targets (Plot only mroast here)
+```{r}
+# Plot settings
+basetextsize <- 12
+myfont <- "sans"
+bubble_max_size <- 24
+mycolors <- c("Up" = "#F21A00", "Down" = "#3B9AB2")
+
+# Combine mroast results
+roast_bound <- imap(pb_mroast_p53, ~ .x %>%
+                      rownames_to_column("pathway")) %>%
+  bind_rows(.id = "cell_type")
+
+# Filter significant results
+roast_filtered <- roast_bound %>%
+  mutate(neglog10fdr = -log10(FDR)) %>%
+  arrange(desc(neglog10fdr)) %>%
+  filter(FDR < 0.2) %>%             # Adjust FDR cutoff as needed
+  filter(cell_type != "dnT")         # Optional: remove dnT if needed
+
+# Create bubble plot
+plot_mroast_p53 <- ggplot(roast_filtered, aes(x = cell_type, y = pathway, color = Direction)) +
+  geom_point(aes(size = neglog10fdr), alpha = 0.65) +
+  scale_color_manual(values = mycolors, name = "Regulation") +
+  scale_size_area(name = expression(-log[10]~FDR), max_size = bubble_max_size) +
+  theme_minimal(base_family = myfont, base_size = basetextsize) +
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    legend.position = "bottom",
+    strip.background = element_blank()
+  ) +
+  coord_flip()
+
+# Show plot
+print(plot_mroast_p53)
+
+# Optional: Save as PDF
+ggsave("mroast_p53_bubbleplot.pdf", plot_mroast_p53, width = 14, height = 14)
+
+```
+
+
+
+
+
+
+
+```{r}
+
+# UMAP Plot - colored by cell type
+umap_camera_plot <- DimPlot(
+  object = refmapped.all,
+  reduction = "ref.umap",                  # Use your existing ref.umap
+  group.by = "predicted.celltype.l2",       # Cell type column
+  label = TRUE,                             # Add cell type labels
+  repel = TRUE,                             # Avoid overlap of labels
+  pt.size = 0.35                            # Size of points
+) +
+  ggtitle("UMAP of PBMC Cell Types") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "none"                # Hide the legend since you have labels
+  )
+
+# Print UMAP
+print(umap_camera_plot)
+
+# Save UMAP as a PDF (optional)
+ggsave("camera_umap_plot.pdf", umap_camera_plot, width = 7, height = 5)
+
+```
+
+
+
+```{r}
+# Create a bright color palette using viridis
+# Option "D" gives bright colors; direction = -1 makes it more colorful
+bright_colors <- viridis(
+  n = length(unique(refmapped.all$predicted.celltype.l2)), 
+  option = "D", 
+  direction = -1
+)
+
+# UMAP Plot - using bright viridis colors
+umap_camera_plot <- DimPlot(
+  object = refmapped.all,
+  reduction = "ref.umap",
+  group.by = "predicted.celltype.l2",
+  label = TRUE,
+  repel = TRUE,
+  pt.size = 0.35
+) +
+  scale_color_manual(values = bright_colors) +   # Apply the viridis color palette
+  ggtitle("UMAP of PBMC Cell Types") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "none"
+  )
+
+# Print UMAP
+print(umap_camera_plot)
+
+# Save UMAP as a PDF (optional)
+ggsave("camera_umap_plot_viridis.pdf", umap_camera_plot, width = 7, height = 5)
+
+```
+
+```{r}
+# Create bright viridis colors
+celltypes <- unique(refmapped.all$predicted.celltype.l2)
+bright_colors <- viridis(
+  n = length(celltypes), 
+  option = "D", 
+  direction = -1
+)
+names(bright_colors) <- celltypes  # Name the colors for proper matching
+
+# UMAP plot with cell type names as legend (not labels on the plot)
+umap_camera_plot <- DimPlot(
+  object = refmapped.all,
+  reduction = "ref.umap",
+  group.by = "predicted.celltype.l2",
+  label = FALSE,       # No labels on points
+  pt.size = 0.35
+) +
+  scale_color_manual(values = bright_colors, name = "Cell Types") +  # Legend on side
+  ggtitle("UMAP of PBMC Cell Types") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "right",         # Show cell names as a legend on the side
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 11, face = "bold")
+  )
+
+# Show the plot
+print(umap_camera_plot)
+
+# Save to file (optional)
+ggsave("camera_umap_plot_with_legend.pdf", umap_camera_plot, width = 8, height = 6)
+
+```
+
